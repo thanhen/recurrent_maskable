@@ -3,7 +3,8 @@ from typing import Generator, NamedTuple, Optional, Union, Callable, Tuple
 
 import numpy as np
 import torch as th
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 from stable_baselines3.common.buffers import DictRolloutBuffer, RolloutBuffer
 from stable_baselines3.common.type_aliases import TensorDict
 from stable_baselines3.common.vec_env import VecNormalize

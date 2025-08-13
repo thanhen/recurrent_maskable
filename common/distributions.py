@@ -3,7 +3,8 @@ from typing import List, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch as th
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 from stable_baselines3.common.distributions import Distribution
 from torch import nn
 from torch.distributions import Categorical

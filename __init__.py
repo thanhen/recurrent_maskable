@@ -1,4 +1,4 @@
 from .policies import CnnLstmPolicy, MlpLstmPolicy, MultiInputLstmPolicy
-from .ppo_recurrent import MaskableRecurrentPPO
+from .ppo_mask_recurrent import RecurrentMaskablePPO
 
-__all__ = ["CnnLstmPolicy", "MlpLstmPolicy", "MultiInputLstmPolicy", "MaskableRecurrentPPO"]
+__all__ = ["CnnLstmPolicy", "MlpLstmPolicy", "MultiInputLstmPolicy", "RecurrentMaskablePPO"]
