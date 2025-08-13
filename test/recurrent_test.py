@@ -24,8 +24,12 @@ lstm_states = None
 num_envs = 1
 # Episode start signals are used to reset the lstm states
 episode_starts = np.ones((num_envs,), dtype=bool)
-while True:
+
+itry = 20
+while itry > 0:
     action, lstm_states = model.predict(obs, state=lstm_states, episode_start=episode_starts, deterministic=True)
     obs, rewards, dones, info = env.step(action)
     episode_starts = dones
-    env.render()
+    # env.render()
+    print(f"action= {action}; done= {dones}; info= {info}; lstm_states= {lstm_states}")
+    itry += -1
