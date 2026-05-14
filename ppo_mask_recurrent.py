@@ -102,6 +102,7 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         target_kl: Optional[float] = None,
+        max_seq_len: int = 0,
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[Dict[str, Any]] = None,
@@ -143,6 +144,7 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
         self.clip_range_vf = clip_range_vf
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
+        self.max_seq_len = max_seq_len
         self._last_lstm_states = None
 
         if _init_setup_model:
@@ -196,6 +198,7 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
             n_envs=self.n_envs,
+            max_seq_len=self.max_seq_len,
         )
 
         # Initialize schedules for policy/value clipping
@@ -433,6 +436,7 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
         clip_fractions = []
 
         continue_training = True
+        _train_logged_mem = False
 
         # train for n_epochs epochs
         for epoch in range(self.n_epochs):
@@ -525,6 +529,29 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
                 # Clip grad norm
                 th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
+
+                if not _train_logged_mem:
+                    _train_logged_mem = True
+                    try:
+                        import ctypes, ctypes.wintypes as _wt
+                        class _PMC(ctypes.Structure):
+                            _fields_ = [('cb', _wt.DWORD), ('PageFaultCount', _wt.DWORD),
+                                        ('PeakWorkingSetSize', ctypes.c_size_t), ('WorkingSetSize', ctypes.c_size_t),
+                                        ('QuotaPeakPagedPoolUsage', ctypes.c_size_t), ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                                        ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t), ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                                        ('PagefileUsage', ctypes.c_size_t), ('PeakPagefileUsage', ctypes.c_size_t),
+                                        ('PrivateUsage', ctypes.c_size_t)]
+                        _gpm = ctypes.windll.psapi.GetProcessMemoryInfo
+                        _gpm.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PMC), _wt.DWORD]
+                        _gpm.restype = _wt.BOOL
+                        _gcp = ctypes.windll.kernel32.GetCurrentProcess
+                        _gcp.restype = ctypes.c_void_p
+                        pmc = _PMC(); pmc.cb = ctypes.sizeof(pmc)
+                        _gpm(_gcp(), ctypes.byref(pmc), pmc.cb)
+                        print(f"  [MEM] train() after 1st batch: {pmc.WorkingSetSize/1024**3:.2f} GB "
+                              f"(peak={pmc.PeakWorkingSetSize/1024**3:.2f} GB)")
+                    except Exception:
+                        pass
 
             if not continue_training:
                 break
