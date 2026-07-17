@@ -42,8 +42,13 @@ class LayerNormLSTM(nn.Module):
         self.num_layers = num_layers
         # Expose dropout so live-tuning code can read/write it.
         self.dropout = kwargs.pop('dropout', 0.0)
+        self.skip_connection = kwargs.pop('skip_connection', False)
         self.layers = nn.ModuleList()
         self.norms = nn.ModuleList()
+        # Projection for layer-0 skip when input_size != hidden_size
+        self.skip_proj = None
+        if self.skip_connection and input_size != hidden_size:
+            self.skip_proj = nn.Linear(input_size, hidden_size, bias=False)
         for i in range(num_layers):
             inp = input_size if i == 0 else hidden_size
             self.layers.append(nn.LSTM(inp, hidden_size, num_layers=1, **kwargs))
@@ -60,12 +65,19 @@ class LayerNormLSTM(nn.Module):
         h_out, c_out = [], []
         out = x
         for i, lstm_layer in enumerate(self.layers):
+            residual = out
             out, (h_i, c_i) = lstm_layer(out, h_list[i])
             h_out.append(h_i)
             c_out.append(c_i)
             if i < self.num_layers - 1:
                 # Apply LayerNorm between layers: (seq, batch, hidden)
                 out = self.norms[i](out)
+                # Skip connection (residual) between layers
+                if self.skip_connection:
+                    if i == 0 and self.skip_proj is not None:
+                        out = out + self.skip_proj(residual)
+                    else:
+                        out = out + residual
                 # Apply dropout between layers (same as nn.LSTM behavior)
                 if self.dropout > 0 and self.training:
                     out = th.nn.functional.dropout(out, p=self.dropout, training=True)
@@ -141,9 +153,11 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
         enable_critic_lstm: bool = True,
         lstm_kwargs: Optional[Dict[str, Any]] = None,
         lstm_layernorm: bool = False,
+        lstm_skip_connection: bool = False,
     ):
         self.lstm_output_dim = lstm_hidden_size
         self.lstm_layernorm = lstm_layernorm
+        self.lstm_skip_connection = lstm_skip_connection
 
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -175,11 +189,13 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
         self.shared_lstm = shared_lstm
         self.enable_critic_lstm = enable_critic_lstm
         _lstm_cls = LayerNormLSTM if (lstm_layernorm and n_lstm_layers > 1) else nn.LSTM
+        _lstm_extra = {'skip_connection': lstm_skip_connection} if _lstm_cls is LayerNormLSTM else {}
         self.lstm_actor = _lstm_cls(
             self.features_dim,
             lstm_hidden_size,
             num_layers=n_lstm_layers,
             **self.lstm_kwargs,
+            **_lstm_extra,
         )
 
 
@@ -209,6 +225,7 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
                 lstm_hidden_size,
                 num_layers=n_lstm_layers,
                 **self.lstm_kwargs,
+                **_lstm_extra,
             )
 
         # Setup optimizer with initial learning rate
