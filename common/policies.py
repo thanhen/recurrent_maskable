@@ -66,6 +66,9 @@ class LayerNormLSTM(nn.Module):
             if i < self.num_layers - 1:
                 # Apply LayerNorm between layers: (seq, batch, hidden)
                 out = self.norms[i](out)
+                # Apply dropout between layers (same as nn.LSTM behavior)
+                if self.dropout > 0 and self.training:
+                    out = th.nn.functional.dropout(out, p=self.dropout, training=True)
 
         return out, (th.cat(h_out, dim=0), th.cat(c_out, dim=0))
 
