@@ -24,6 +24,52 @@ from sb3_contrib.common.maskable.distributions import MaskableDistribution, make
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
 
 
+class LayerNormLSTM(nn.Module):
+    """Stacked LSTM with LayerNorm between layers.
+
+    Presents the same interface as ``nn.LSTM`` (input_size, hidden_size,
+    num_layers, dropout) so it can be used as a drop-in replacement.
+    Between each pair of LSTM layers, a ``nn.LayerNorm(hidden_size)`` is
+    applied to the hidden output before feeding it into the next layer.
+    This stabilises gradient flow across deep LSTM stacks.
+    """
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1,
+                 **kwargs):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        # Expose dropout so live-tuning code can read/write it.
+        self.dropout = kwargs.pop('dropout', 0.0)
+        self.layers = nn.ModuleList()
+        self.norms = nn.ModuleList()
+        for i in range(num_layers):
+            inp = input_size if i == 0 else hidden_size
+            self.layers.append(nn.LSTM(inp, hidden_size, num_layers=1, **kwargs))
+            if i < num_layers - 1:
+                self.norms.append(nn.LayerNorm(hidden_size))
+
+    def forward(self, x, hx=None):
+        # hx: (h, c) each (num_layers, batch, hidden)
+        if hx is None:
+            h_list = [None] * self.num_layers
+        else:
+            h_list = [(hx[0][i:i+1], hx[1][i:i+1]) for i in range(self.num_layers)]
+
+        h_out, c_out = [], []
+        out = x
+        for i, lstm_layer in enumerate(self.layers):
+            out, (h_i, c_i) = lstm_layer(out, h_list[i])
+            h_out.append(h_i)
+            c_out.append(c_i)
+            if i < self.num_layers - 1:
+                # Apply LayerNorm between layers: (seq, batch, hidden)
+                out = self.norms[i](out)
+
+        return out, (th.cat(h_out, dim=0), th.cat(c_out, dim=0))
+
+
 class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
     """
     Recurrent policy class for actor-critic algorithms (has both policy and value prediction).
@@ -91,8 +137,10 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
         shared_lstm: bool = False,
         enable_critic_lstm: bool = True,
         lstm_kwargs: Optional[Dict[str, Any]] = None,
+        lstm_layernorm: bool = False,
     ):
         self.lstm_output_dim = lstm_hidden_size
+        self.lstm_layernorm = lstm_layernorm
 
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -123,7 +171,8 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
         self.lstm_kwargs = lstm_kwargs or {}
         self.shared_lstm = shared_lstm
         self.enable_critic_lstm = enable_critic_lstm
-        self.lstm_actor = nn.LSTM(
+        _lstm_cls = LayerNormLSTM if (lstm_layernorm and n_lstm_layers > 1) else nn.LSTM
+        self.lstm_actor = _lstm_cls(
             self.features_dim,
             lstm_hidden_size,
             num_layers=n_lstm_layers,
@@ -152,7 +201,7 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
 
         # Use a separate LSTM for the critic
         if self.enable_critic_lstm:
-            self.lstm_critic = nn.LSTM(
+            self.lstm_critic = _lstm_cls(
                 self.features_dim,
                 lstm_hidden_size,
                 num_layers=n_lstm_layers,
