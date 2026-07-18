@@ -542,8 +542,14 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
                 # Optimization step
                 self.policy.optimizer.zero_grad()
                 loss.backward()
-                # Clip grad norm
-                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                # Clip grad norm — per param-group when actor/critic are separated,
+                # so the critic's large gradients don't eat the actor's clip budget.
+                if getattr(self.policy, "actor_lr_mult", 1.0) != 1.0:
+                    for pg in self.policy.optimizer.param_groups:
+                        if pg["params"]:
+                            th.nn.utils.clip_grad_norm_(pg["params"], self.max_grad_norm)
+                else:
+                    th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
                 self.policy.optimizer.step()
 
                 if not _train_logged_mem:
