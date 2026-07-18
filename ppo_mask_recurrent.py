@@ -417,6 +417,22 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
 
         return True
 
+    def _update_learning_rate(self, optimizers) -> None:
+        """Update LR with per-group actor_lr_mult support."""
+        lr = self.lr_schedule(self._current_progress_remaining)
+        self.logger.record("train/learning_rate", lr)
+        actor_mult = getattr(self.policy, "actor_lr_mult", 1.0)
+        if actor_mult != 1.0:
+            self.logger.record("train/actor_lr", lr * actor_mult)
+        if not isinstance(optimizers, list):
+            optimizers = [optimizers]
+        for optimizer in optimizers:
+            for pg in optimizer.param_groups:
+                if pg.get("name") == "actor":
+                    pg["lr"] = lr * actor_mult
+                else:
+                    pg["lr"] = lr
+
     def train(self) -> None:
         """
         Update policy using the currently gathered rollout buffer.

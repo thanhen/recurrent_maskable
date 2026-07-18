@@ -154,10 +154,12 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
         lstm_kwargs: Optional[Dict[str, Any]] = None,
         lstm_layernorm: bool = False,
         lstm_skip_connection: bool = False,
+        actor_lr_mult: float = 1.0,
     ):
         self.lstm_output_dim = lstm_hidden_size
         self.lstm_layernorm = lstm_layernorm
         self.lstm_skip_connection = lstm_skip_connection
+        self.actor_lr_mult = actor_lr_mult
 
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -229,11 +231,44 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
             )
 
         # Setup optimizer with initial learning rate
-        self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
+        self.optimizer = self._build_optimizer(lr_schedule(1))
 
         # Action distribution
         self.action_dist = make_masked_proba_distribution(action_space)
 
+    def _build_optimizer(self, lr: float) -> th.optim.Optimizer:
+        """Build optimizer with separate actor/critic param groups."""
+        if self.actor_lr_mult == 1.0:
+            # No separation needed — single group (backward compatible)
+            return self.optimizer_class(
+                self.parameters(), lr=lr, **self.optimizer_kwargs,
+            )
+        # Collect actor param ids
+        actor_modules = [self.lstm_actor, self.mlp_extractor.policy_net, self.action_net]
+        actor_ids = {id(p) for m in actor_modules for p in m.parameters()}
+        # Collect critic param ids
+        critic_modules = [
+            m for m in [self.lstm_critic, self.critic,
+                        self.mlp_extractor.value_net, self.value_net]
+            if m is not None
+        ]
+        critic_ids = {id(p) for m in critic_modules for p in m.parameters()}
+        # Everything else is shared (features_extractor, etc.)
+        actor_params, critic_params, shared_params = [], [], []
+        for p in self.parameters():
+            pid = id(p)
+            if pid in actor_ids:
+                actor_params.append(p)
+            elif pid in critic_ids:
+                critic_params.append(p)
+            else:
+                shared_params.append(p)
+        groups = [
+            {"params": shared_params, "lr": lr, "name": "shared"},
+            {"params": actor_params,  "lr": lr * self.actor_lr_mult, "name": "actor"},
+            {"params": critic_params, "lr": lr, "name": "critic"},
+        ]
+        return self.optimizer_class(groups, **self.optimizer_kwargs)
 
     def _build_mlp_extractor(self) -> None:
         """
