@@ -243,15 +243,21 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
             return self.optimizer_class(
                 self.parameters(), lr=lr, **self.optimizer_kwargs,
             )
-        # Collect actor param ids
+        # Collect actor param ids — include features_extractor when not shared,
+        # so per-group grad clipping gives it its own budget (otherwise the
+        # critic's vf_features_extractor dominates the "shared" group norm).
         actor_modules = [self.lstm_actor, self.mlp_extractor.policy_net, self.action_net]
+        if not self.share_features_extractor:
+            actor_modules.append(self.features_extractor)
         actor_ids = {id(p) for m in actor_modules for p in m.parameters()}
-        # Collect critic param ids
+        # Collect critic param ids — include vf_features_extractor when not shared
         critic_modules = [
             m for m in [self.lstm_critic, self.critic,
                         self.mlp_extractor.value_net, self.value_net]
             if m is not None
         ]
+        if not self.share_features_extractor and hasattr(self, 'vf_features_extractor'):
+            critic_modules.append(self.vf_features_extractor)
         critic_ids = {id(p) for m in critic_modules for p in m.parameters()}
         # Everything else is shared (features_extractor, etc.)
         actor_params, critic_params, shared_params = [], [], []
