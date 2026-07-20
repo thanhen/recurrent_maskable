@@ -85,6 +85,101 @@ class LayerNormLSTM(nn.Module):
         return out, (th.cat(h_out, dim=0), th.cat(c_out, dim=0))
 
 
+class ResNormMlpExtractor(nn.Module):
+    """MlpExtractor with optional LayerNorm and skip connections between layers.
+
+    Drop-in replacement for SB3's MlpExtractor.  Each hidden layer becomes:
+        Linear -> LayerNorm (optional) -> Activation -> (+residual, optional)
+
+    Skip connections require input_dim == output_dim for each residual block.
+    When dims differ (first layer or dim change), a linear projection is used.
+    """
+
+    def __init__(
+        self,
+        feature_dim: int,
+        net_arch: Union[List[int], Dict[str, List[int]]],
+        activation_fn: Type[nn.Module],
+        device: Union[th.device, str] = "auto",
+        use_layernorm: bool = True,
+        skip_connection: bool = True,
+    ) -> None:
+        super().__init__()
+        from stable_baselines3.common.utils import get_device
+        device = get_device(device)
+
+        if isinstance(net_arch, dict):
+            pi_layers_dims = net_arch.get("pi", [])
+            vf_layers_dims = net_arch.get("vf", [])
+        else:
+            pi_layers_dims = vf_layers_dims = net_arch
+
+        self.policy_net = self._build_net(
+            feature_dim, pi_layers_dims, activation_fn, use_layernorm, skip_connection
+        ).to(device)
+        self.value_net = self._build_net(
+            feature_dim, vf_layers_dims, activation_fn, use_layernorm, skip_connection
+        ).to(device)
+
+        self.latent_dim_pi = pi_layers_dims[-1] if pi_layers_dims else feature_dim
+        self.latent_dim_vf = vf_layers_dims[-1] if vf_layers_dims else feature_dim
+
+    @staticmethod
+    def _build_net(input_dim, layer_dims, activation_fn, use_layernorm, skip_connection):
+        if not layer_dims:
+            return nn.Sequential()
+        modules = nn.ModuleList()
+        last_dim = input_dim
+        for dim in layer_dims:
+            block = [nn.Linear(last_dim, dim)]
+            if use_layernorm:
+                block.append(nn.LayerNorm(dim))
+            block.append(activation_fn())
+            # Wrap as a residual block if skip_connection is enabled
+            if skip_connection:
+                proj = nn.Linear(last_dim, dim, bias=False) if last_dim != dim else None
+                modules.append(_ResBlock(nn.Sequential(*block), proj))
+            else:
+                modules.append(nn.Sequential(*block))
+            last_dim = dim
+        return _SequentialModuleList(modules)
+
+    def forward(self, features: th.Tensor):
+        return self.forward_actor(features), self.forward_critic(features)
+
+    def forward_actor(self, features: th.Tensor) -> th.Tensor:
+        return self.policy_net(features)
+
+    def forward_critic(self, features: th.Tensor) -> th.Tensor:
+        return self.value_net(features)
+
+
+class _ResBlock(nn.Module):
+    """Single residual block: output = block(x) + proj(x)."""
+
+    def __init__(self, block: nn.Module, proj: Optional[nn.Module] = None):
+        super().__init__()
+        self.block = block
+        self.proj = proj
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        residual = self.proj(x) if self.proj is not None else x
+        return self.block(x) + residual
+
+
+class _SequentialModuleList(nn.Module):
+    """nn.ModuleList that runs sequentially (compatible with nn.Sequential interface)."""
+
+    def __init__(self, modules: nn.ModuleList):
+        super().__init__()
+        self.layers = modules
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
 class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
     """
     Recurrent policy class for actor-critic algorithms (has both policy and value prediction).
@@ -155,11 +250,15 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
         lstm_layernorm: bool = False,
         lstm_skip_connection: bool = False,
         actor_lr_mult: float = 1.0,
+        mlp_layernorm: bool = False,
+        mlp_skip_connection: bool = False,
     ):
         self.lstm_output_dim = lstm_hidden_size
         self.lstm_layernorm = lstm_layernorm
         self.lstm_skip_connection = lstm_skip_connection
         self.actor_lr_mult = actor_lr_mult
+        self.mlp_layernorm = mlp_layernorm
+        self.mlp_skip_connection = mlp_skip_connection
 
         if optimizer_kwargs is None:
             optimizer_kwargs = {}
@@ -281,12 +380,22 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
         Create the policy and value networks.
         Part of the layers can be shared.
         """
-        self.mlp_extractor = MlpExtractor(
-            self.lstm_output_dim,
-            net_arch=self.net_arch,
-            activation_fn=self.activation_fn,
-            device=self.device,
-        )
+        if self.mlp_layernorm or self.mlp_skip_connection:
+            self.mlp_extractor = ResNormMlpExtractor(
+                self.lstm_output_dim,
+                net_arch=self.net_arch,
+                activation_fn=self.activation_fn,
+                device=self.device,
+                use_layernorm=self.mlp_layernorm,
+                skip_connection=self.mlp_skip_connection,
+            )
+        else:
+            self.mlp_extractor = MlpExtractor(
+                self.lstm_output_dim,
+                net_arch=self.net_arch,
+                activation_fn=self.activation_fn,
+                device=self.device,
+            )
 
     @staticmethod
     def _process_sequence(
