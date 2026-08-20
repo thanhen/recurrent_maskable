@@ -382,13 +382,13 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
 
         # Prepare the data — work on copies to preserve originals for reuse
         if not self.generator_ready:
-            # LSTM states are NOT flattened here: only n_seq rows out of buffer_size * n_envs
-            # are ever read, so _get_samples indexes the originals directly.
+            # observations and the LSTM states are NOT flattened here: a flat copy would
+            # double the largest arrays in the buffer, and _get_samples only ever reads
+            # n_seq rows of the states and one window at a time of the observations.
             # flatten but keep the sequence order
             # 1. (n_steps, n_envs, *tensor_shape) -> (n_envs, n_steps, *tensor_shape)
             # 2. (n_envs, n_steps, *tensor_shape) -> (n_envs * n_steps, *tensor_shape)
             for tensor in [
-                "observations",
                 "actions",
                 "values",
                 "log_probs",
@@ -422,6 +422,26 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
             batch_inds = indices[start_idx : start_idx + batch_size]
             yield self._get_samples(batch_inds, env_change)
             start_idx += batch_size
+
+    def _pad_observations(self, batch_inds: np.ndarray, max_length: int) -> th.Tensor:
+        """
+        Build the padded observation tensor straight from the rollout array.
+
+        Observations dominate the buffer (2.6 GB at n_steps=4096, n_envs=8, obs_dim=20040),
+        so a flattened copy would double the master process footprint for no benefit:
+        every window is copied into the padded tensor one at a time anyway.
+        """
+        step_idx = batch_inds % self.buffer_size
+        env_idx = batch_inds // self.buffer_size
+        out = th.zeros(
+            (len(self.seq_start_indices), max_length, *self.obs_shape),
+            dtype=th.float32,
+            device=self.device,
+        )
+        for i, (start, end) in enumerate(zip(self.seq_start_indices, self.seq_end_indices)):
+            window = self.observations[step_idx[start:end + 1], env_idx[start:end + 1]]
+            out[i, : end - start + 1] = th.as_tensor(window, device=self.device)
+        return out
 
     def _get_samples(
         self,
@@ -471,7 +491,7 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
 
         return RecurrentMaskableRolloutBufferSamples(
             # (batch_size, obs_dim) -> (n_seq, max_length, obs_dim) -> (n_seq * max_length, obs_dim)
-            observations=self.pad(self._flat_observations[batch_inds]).reshape((padded_batch_size, *self.obs_shape)),
+            observations=self._pad_observations(batch_inds, max_length).reshape((padded_batch_size, *self.obs_shape)),
             actions=self.pad(self._flat_actions[batch_inds]).reshape((padded_batch_size,) + self._flat_actions.shape[1:]),
             old_values=self.pad_and_flatten(self._flat_values[batch_inds]),
             old_log_prob=self.pad_and_flatten(self._flat_log_probs[batch_inds]),
