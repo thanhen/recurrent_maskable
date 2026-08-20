@@ -440,7 +440,8 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
         )
         for i, (start, end) in enumerate(zip(self.seq_start_indices, self.seq_end_indices)):
             window = self.observations[step_idx[start:end + 1], env_idx[start:end + 1]]
-            out[i, : end - start + 1] = th.as_tensor(window, device=self.device)
+            # copy_ writes host -> device straight into the slice, no staging tensor
+            out[i, : end - start + 1].copy_(th.from_numpy(window))
         return out
 
     def _get_samples(
