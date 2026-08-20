@@ -16,12 +16,43 @@ from stable_baselines3.common.torch_layers import (
     NatureCNN,
 )
 from stable_baselines3.common.type_aliases import Schedule
-from stable_baselines3.common.utils import zip_strict
 from torch import nn
 
 
 from sb3_contrib.common.maskable.distributions import MaskableDistribution, make_masked_proba_distribution
 from sb3_contrib.common.recurrent.type_aliases import RNNStates
+
+
+def run_lstm_segments(
+    lstm: nn.LSTM,
+    features_sequence: th.Tensor,
+    episode_starts_seq: th.Tensor,
+    lstm_states: Tuple[th.Tensor, th.Tensor],
+) -> Tuple[th.Tensor, Tuple[th.Tensor, th.Tensor]]:
+    """
+    Run the LSTM over a padded window, cutting it only where some sequence resets.
+
+    Sequence packing splits long episodes to fill windows, so a minibatch nearly always
+    contains at least one episode start in the middle of a window. Checking that
+    globally used to send the whole minibatch through a per-timestep Python loop, whose
+    cost grows linearly with the window length. Here the number of LSTM calls is the
+    number of distinct reset rows (about ten per minibatch) instead of the window
+    length, while staying bit-for-bit equivalent to the loop.
+    """
+    n_seq = features_sequence.shape[1]
+    reset_rows = th.nonzero(episode_starts_seq.ne(0.0).any(dim=1)).flatten().tolist()
+    bounds = sorted({0, *reset_rows})
+    bounds.append(features_sequence.shape[0])
+
+    outputs = []
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        keep = (1.0 - episode_starts_seq[start]).view(1, n_seq, 1)
+        lstm_states = (keep * lstm_states[0], keep * lstm_states[1])
+        output, lstm_states = lstm(features_sequence[start:end], lstm_states)
+        outputs.append(output)
+
+    lstm_output = outputs[0] if len(outputs) == 1 else th.cat(outputs)
+    return lstm_output, lstm_states
 
 
 class LayerNormLSTM(nn.Module):
@@ -315,31 +346,10 @@ class RecurrentMaskableActorCriticPolicy(ActorCriticPolicy):
         features_sequence = features.reshape((n_seq, -1, lstm.input_size)).swapaxes(0, 1)
         episode_starts = episode_starts.reshape((n_seq, -1)).swapaxes(0, 1)
 
-        # A reset on the first step only needs masking the seed state, so the whole
-        # window still goes through one fused call instead of the per-timestep loop
-        # (the loop costs ~7x more at window 40 and ~25x at window 128).
-        if th.all(episode_starts[1:] == 0.0):
-            first_start = episode_starts[0].view(1, n_seq, 1)
-            lstm_states = ((1.0 - first_start) * lstm_states[0], (1.0 - first_start) * lstm_states[1])
-            lstm_output, lstm_states = lstm(features_sequence, lstm_states)
-            lstm_output = th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
-            return lstm_output, lstm_states
-
-        lstm_output = []
-        # Iterate over the sequence
-        for features, episode_start in zip_strict(features_sequence, episode_starts):
-            hidden, lstm_states = lstm(
-                features.unsqueeze(dim=0),
-                (
-                    # Reset the states at the beginning of a new episode
-                    (1.0 - episode_start).view(1, n_seq, 1) * lstm_states[0],
-                    (1.0 - episode_start).view(1, n_seq, 1) * lstm_states[1],
-                ),
-            )
-            lstm_output += [hidden]
+        lstm_output, lstm_states = run_lstm_segments(lstm, features_sequence, episode_starts, lstm_states)
         # Sequence to batch
         # (sequence length, n_seq, lstm_out_dim) -> (batch_size, lstm_out_dim)
-        lstm_output = th.flatten(th.cat(lstm_output).transpose(0, 1), start_dim=0, end_dim=1)
+        lstm_output = th.flatten(lstm_output.transpose(0, 1), start_dim=0, end_dim=1)
         return lstm_output, lstm_states
 
     def forward(
