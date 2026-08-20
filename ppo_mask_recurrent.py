@@ -103,6 +103,9 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
         sde_sample_freq: int = -1,
         target_kl: Optional[float] = None,
         max_seq_len: int = 0,
+        seq_len_min: int = 32,
+        seq_len_cap: int = 128,
+        seq_len_fill_ratio: float = 0.15,
         stats_window_size: int = 100,
         tensorboard_log: Optional[str] = None,
         policy_kwargs: Optional[Dict[str, Any]] = None,
@@ -145,6 +148,9 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
         self.normalize_advantage = normalize_advantage
         self.target_kl = target_kl
         self.max_seq_len = max_seq_len
+        self.seq_len_min = seq_len_min
+        self.seq_len_cap = seq_len_cap
+        self.seq_len_fill_ratio = seq_len_fill_ratio
         self._last_lstm_states = None
 
         if _init_setup_model:
@@ -189,6 +195,10 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
 
         hidden_state_buffer_shape = (self.n_steps, lstm.num_layers, self.n_envs, lstm.hidden_size)
 
+        buffer_kwargs = dict(max_seq_len=self.max_seq_len, seq_len_fill_ratio=self.seq_len_fill_ratio)
+        if buffer_cls is RecurrentMaskableRolloutBuffer:
+            buffer_kwargs.update(seq_len_min=self.seq_len_min, seq_len_cap=self.seq_len_cap)
+
         self.rollout_buffer = buffer_cls(
             self.n_steps,
             self.observation_space,
@@ -198,7 +208,7 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
             gamma=self.gamma,
             gae_lambda=self.gae_lambda,
             n_envs=self.n_envs,
-            max_seq_len=self.max_seq_len,
+            **buffer_kwargs,
         )
 
         # Initialize schedules for policy/value clipping
@@ -441,6 +451,9 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
         self.policy.set_training_mode(True)
         # Update optimizer learning rate
         self._update_learning_rate(self.policy.optimizer)
+        # Sequence-length stats and auto window sizing, once per rollout
+        if hasattr(self.rollout_buffer, "update_auto_seq_len"):
+            self.rollout_buffer.update_auto_seq_len()
         # Compute current clip range
         clip_range = self.clip_range(self._current_progress_remaining)
         # Optional: clip range for the value function
@@ -596,6 +609,19 @@ class RecurrentMaskablePPO(OnPolicyAlgorithm):
         self.logger.record("train/clip_range", clip_range)
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
+
+        if hasattr(self.rollout_buffer, "get_seq_stats"):
+            seq_stats = self.rollout_buffer.get_seq_stats()
+            for key, value in seq_stats.items():
+                self.logger.record(f"buffer/{key}", value)
+            print(f"  [BUFFER] seq_len p50={seq_stats.get('p50', 0):.0f} "
+                  f"p90={seq_stats.get('p90', 0):.0f} p99={seq_stats.get('p99', 0):.0f} "
+                  f"max={seq_stats.get('max', 0):.0f} | window={seq_stats['max_seq_len_eff']:.0f} "
+                  f"n_seq={seq_stats.get('n_seq', 0):.0f} "
+                  f"pad_ratio mean={seq_stats.get('pad_ratio_mean', 0):.2f}x "
+                  f"max={seq_stats.get('pad_ratio_max', 0):.2f}x", flush=True)
+            if seq_stats.get("pad_ratio_max", 0.0) > 1.3:
+                print("  [BUFFER] WARNING: padding ratio above 1.3x, packing is degrading", flush=True)
 
 
     def learn(

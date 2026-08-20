@@ -43,6 +43,10 @@ class RecurrentMaskableDictRolloutBufferSamples(NamedTuple):
     action_masks: th.Tensor
 
 
+# Window sizes the auto mode (max_seq_len < 0) climbs as episodes get longer.
+SEQ_LEN_RUNGS = (16, 24, 32, 48, 64, 96, 128, 192, 256, 360)
+
+
 def pad(
     seq_start_indices: np.ndarray,
     seq_end_indices: np.ndarray,
@@ -89,12 +93,80 @@ def pad_and_flatten(
     return pad(seq_start_indices, seq_end_indices, device, tensor, padding_value).flatten()
 
 
+def pack_sequences(
+    seq_start_indices: np.ndarray,
+    seq_end_indices: np.ndarray,
+    force_break: np.ndarray,
+    max_seq_len: int,
+    fill_ratio: float = 0.15,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Pack consecutive episodes into windows of capacity ``max_seq_len``.
+
+    Padding is what blows up memory: every window is padded to the longest one in the
+    minibatch, so a handful of long episodes used to inflate the whole batch. Packing
+    several short episodes into one window keeps the padded batch close to the real
+    batch size whatever the episode length distribution looks like.
+
+    A window is closed early (leaving padding) only when it is already at least
+    ``1 - fill_ratio`` full; otherwise the next episode is split to fill it exactly.
+    That bounds the padding ratio at ``1 / (1 - fill_ratio)`` while leaving short
+    episodes intact as long as episodes stay much shorter than ``max_seq_len``.
+
+    Windows never cross an env boundary and always tile the input contiguously,
+    so no transition is dropped or duplicated.
+    """
+    min_fill = int(max_seq_len * (1.0 - fill_ratio))
+    new_starts: list = []
+    new_ends: list = []
+    cur_start = 0
+    cur_len = 0
+
+    def close_window():
+        nonlocal cur_len
+        if cur_len > 0:
+            new_starts.append(cur_start)
+            new_ends.append(cur_start + cur_len - 1)
+            cur_len = 0
+
+    for i in range(len(seq_start_indices)):
+        if force_break[i]:
+            close_window()
+        pos = int(seq_start_indices[i])
+        remaining = int(seq_end_indices[i]) - pos + 1
+        while remaining > 0:
+            if cur_len == 0:
+                cur_start = pos
+            space = max_seq_len - cur_len
+            if remaining <= space:
+                cur_len += remaining
+                pos += remaining
+                remaining = 0
+                if cur_len == max_seq_len:
+                    close_window()
+            elif cur_len < min_fill:
+                cur_len += space
+                pos += space
+                remaining -= space
+                close_window()
+            else:
+                # Already full enough: closing wastes less than splitting the episode.
+                close_window()
+    close_window()
+
+    return (
+        np.array(new_starts, dtype=np.int64),
+        np.array(new_ends, dtype=np.int64),
+    )
+
+
 def create_sequencers(
     episode_starts: np.ndarray,
     env_change: np.ndarray,
     device: th.device,
     max_seq_len: int = 0,
-) -> Tuple[np.ndarray, Callable, Callable]:
+    fill_ratio: float = 0.15,
+) -> Tuple[np.ndarray, np.ndarray, Callable, Callable]:
     """
     Create the utility function to chunk data into
     sequences and pad them to create fixed size tensors.
@@ -103,12 +175,11 @@ def create_sequencers(
     :param env_change: Indices where the data collected
         come from a different env (when using multiple env for data collection)
     :param device: PyTorch device
-    :param max_seq_len: If > 0, split sequences longer than this into chunks.
-        If < 0 (e.g. -1), auto mode: cap at 2 * p99 of raw sequence lengths.
-        If 0, no splitting (original behavior).
-        This prevents padding explosion when a few long episodes force
-        all sequences to be padded to the max length.
-    :return: Indices of the transitions that start a sequence,
+    :param max_seq_len: Window capacity for packing. 0 disables packing
+        (one sequence per episode, original behavior).
+    :param fill_ratio: Max fraction of a window left as padding before an episode
+        gets split to fill it.
+    :return: Indices of the transitions that start/end a sequence,
         pad and pad_and_flatten utilities tailored for this batch
         (sequence starts and ends indices are fixed)
     """
@@ -122,37 +193,18 @@ def create_sequencers(
     # Last index is also always end of a sequence
     seq_end_indices = np.concatenate([(seq_start_indices - 1)[1:], np.array([len(episode_starts) - 1])])
 
-    # Split long sequences into chunks of max_seq_len
-    # max_seq_len > 0: fixed cap; max_seq_len < 0: auto (2 * p99)
-    effective_max_seq_len = max_seq_len
-    if max_seq_len < 0:
-        raw_lens = seq_end_indices - seq_start_indices + 1
-        effective_max_seq_len = max(int(np.percentile(raw_lens, 99)) * 2, 4)
-
-    if effective_max_seq_len > 0:
-        new_starts = []
-        new_ends = []
-        for s, e in zip(seq_start_indices, seq_end_indices):
-            seq_len = e - s + 1
-            if seq_len <= effective_max_seq_len:
-                new_starts.append(s)
-                new_ends.append(e)
-            else:
-                # Split into chunks
-                pos = s
-                while pos <= e:
-                    chunk_end = min(pos + effective_max_seq_len - 1, e)
-                    new_starts.append(pos)
-                    new_ends.append(chunk_end)
-                    pos = chunk_end + 1
-        seq_start_indices = np.array(new_starts, dtype=np.int64)
-        seq_end_indices = np.array(new_ends, dtype=np.int64)
+    if max_seq_len > 0:
+        force_break = np.asarray(env_change).flatten()[seq_start_indices] > 0
+        force_break[0] = True
+        seq_start_indices, seq_end_indices = pack_sequences(
+            seq_start_indices, seq_end_indices, force_break, max_seq_len, fill_ratio
+        )
 
     # Create padding method for this minibatch
     # to avoid repeating arguments (seq_start_indices, seq_end_indices)
     local_pad = partial(pad, seq_start_indices, seq_end_indices, device)
     local_pad_and_flatten = partial(pad_and_flatten, seq_start_indices, seq_end_indices, device)
-    return seq_start_indices, local_pad, local_pad_and_flatten
+    return seq_start_indices, seq_end_indices, local_pad, local_pad_and_flatten
 
 
 class RecurrentMaskableRolloutBuffer(RolloutBuffer):
@@ -182,13 +234,76 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
         gamma: float = 0.99,
         n_envs: int = 1,
         max_seq_len: int = 0,
+        seq_len_min: int = 32,
+        seq_len_cap: int = 128,
+        seq_len_fill_ratio: float = 0.15,
     ):
         self.hidden_state_shape = hidden_state_shape
         self.seq_start_indices, self.seq_end_indices = None, None
         self._buffers_allocated = False
         self.max_seq_len = max_seq_len
+        self.seq_len_min = seq_len_min
+        self.seq_len_cap = seq_len_cap
+        self.seq_len_fill_ratio = seq_len_fill_ratio
+        # Auto mode (max_seq_len < 0) climbs these rungs as episodes get longer.
+        self._auto_seq_len = seq_len_min
+        self._auto_over_count = 0
+        self._seq_len_percentiles = {}
+        self._reset_pad_stats()
         super().__init__(buffer_size, observation_space, action_space, device, gae_lambda, gamma, n_envs)
 
+    @property
+    def effective_seq_len(self) -> int:
+        return self._auto_seq_len if self.max_seq_len < 0 else self.max_seq_len
+
+    def _reset_pad_stats(self) -> None:
+        self._pad_stats = {"padded": 0, "real": 0, "n_seq": 0, "calls": 0, "ratio_max": 0.0}
+
+    def raw_seq_lengths(self) -> np.ndarray:
+        """Episode lengths over the whole rollout, per env, before any packing."""
+        lengths = []
+        for env_idx in range(self.n_envs):
+            starts = np.flatnonzero(self.episode_starts[:, env_idx])
+            if starts.size == 0 or starts[0] != 0:
+                starts = np.concatenate(([0], starts))
+            ends = np.concatenate((starts[1:] - 1, [self.buffer_size - 1]))
+            lengths.append(ends - starts + 1)
+        return np.concatenate(lengths)
+
+    def update_auto_seq_len(self) -> None:
+        """Recompute sequence-length stats once per rollout, and grow the auto window."""
+        lengths = self.raw_seq_lengths()
+        self._seq_len_percentiles = {
+            "p50": float(np.percentile(lengths, 50)),
+            "p90": float(np.percentile(lengths, 90)),
+            "p99": float(np.percentile(lengths, 99)),
+            "max": float(lengths.max()),
+        }
+        if self.max_seq_len >= 0:
+            return
+        p99 = self._seq_len_percentiles["p99"]
+        if p99 > self._auto_seq_len and self._auto_seq_len < self.seq_len_cap:
+            self._auto_over_count += 1
+        else:
+            self._auto_over_count = 0
+        # Require several rollouts in a row before growing: changing the window changes
+        # both throughput and where BPTT is truncated.
+        if self._auto_over_count >= 3:
+            for rung in SEQ_LEN_RUNGS:
+                if rung > self._auto_seq_len and rung <= self.seq_len_cap:
+                    self._auto_seq_len = rung
+                    break
+            self._auto_over_count = 0
+
+    def get_seq_stats(self) -> dict:
+        stats = dict(self._seq_len_percentiles)
+        s = self._pad_stats
+        if s["calls"] > 0:
+            stats["pad_ratio_mean"] = s["padded"] / max(s["real"], 1)
+            stats["pad_ratio_max"] = s["ratio_max"]
+            stats["n_seq"] = s["n_seq"] / s["calls"]
+        stats["max_seq_len_eff"] = float(self.effective_seq_len)
+        return stats
 
     def reset(self):
         if isinstance(self.action_space, spaces.Discrete):
@@ -230,7 +345,7 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
             for key in list(self.__dict__):
                 if key.startswith('_flat_'):
                     del self.__dict__[key]
-            self._pad_logged = False
+            self._reset_pad_stats()
             self.generator_ready = False
             # BaseBuffer.reset()
             self.pos = 0
@@ -243,6 +358,7 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
             self.hidden_states_vf = np.zeros(self.hidden_state_shape, dtype=np.float32)
             self.cell_states_vf = np.zeros(self.hidden_state_shape, dtype=np.float32)
             self._buffers_allocated = True
+            self._reset_pad_stats()
 
 
     def add(self, *args, lstm_states: RNNStates, action_masks: Optional[np.ndarray] = None, **kwargs) -> None:
@@ -266,11 +382,8 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
 
         # Prepare the data — work on copies to preserve originals for reuse
         if not self.generator_ready:
-            # hidden_state_shape = (self.n_steps, lstm.num_layers, self.n_envs, lstm.hidden_size)
-            # swap first to (self.n_steps, self.n_envs, lstm.num_layers, lstm.hidden_size)
-            for tensor in ["hidden_states_pi", "cell_states_pi", "hidden_states_vf", "cell_states_vf"]:
-                self.__dict__[f"_flat_{tensor}"] = self.__dict__[tensor].swapaxes(1, 2)
-
+            # LSTM states are NOT flattened here: only n_seq rows out of buffer_size * n_envs
+            # are ever read, so _get_samples indexes the originals directly.
             # flatten but keep the sequence order
             # 1. (n_steps, n_envs, *tensor_shape) -> (n_envs, n_steps, *tensor_shape)
             # 2. (n_envs, n_steps, *tensor_shape) -> (n_envs * n_steps, *tensor_shape)
@@ -285,8 +398,6 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
                 "action_masks",
             ]:
                 self.__dict__[f"_flat_{tensor}"] = self.swap_and_flatten(self.__dict__[tensor])
-            for tensor in ["hidden_states_pi", "cell_states_pi", "hidden_states_vf", "cell_states_vf"]:
-                self.__dict__[f"_flat_{tensor}"] = self.swap_and_flatten(self.__dict__[f"_flat_{tensor}"])
             self.generator_ready = True
 
         # Return everything, don't create minibatches
@@ -319,54 +430,41 @@ class RecurrentMaskableRolloutBuffer(RolloutBuffer):
         env: Optional[VecNormalize] = None,
     ) -> RecurrentMaskableRolloutBufferSamples:
         # Retrieve sequence starts and utility function
-        self.seq_start_indices, self.pad, self.pad_and_flatten = create_sequencers(
+        self.seq_start_indices, self.seq_end_indices, self.pad, self.pad_and_flatten = create_sequencers(
             self._flat_episode_starts[batch_inds], env_change[batch_inds], self.device,
-            max_seq_len=self.max_seq_len,
+            max_seq_len=self.effective_seq_len,
+            fill_ratio=self.seq_len_fill_ratio,
         )
 
         # Number of sequences
         n_seq = len(self.seq_start_indices)
-        max_length = self.pad(self._flat_actions[batch_inds]).shape[1]
+        max_length = int((self.seq_end_indices - self.seq_start_indices).max()) + 1
         padded_batch_size = n_seq * max_length
-        if not hasattr(self, '_pad_logged') or not self._pad_logged:
-            # Log sequence length distribution BEFORE max_seq_len cap
-            # Use seq lengths from create_sequencers (already capped)
-            # but also compute raw for comparison
-            raw_starts = np.where(
-                np.logical_or(self._flat_episode_starts[batch_inds],
-                              env_change[batch_inds]).flatten()
-            )[0]
-            raw_starts[0] = 0  # force first
-            raw_ends = np.concatenate([(raw_starts - 1)[1:], np.array([len(batch_inds) - 1])])
-            raw_lens = raw_ends - raw_starts + 1
-            p50 = int(np.percentile(raw_lens, 50))
-            p90 = int(np.percentile(raw_lens, 90))
-            p99 = int(np.percentile(raw_lens, 99))
-            raw_max = int(raw_lens.max())
-            print(f"  [BUFFER] batch_inds={len(batch_inds)}, n_seq={n_seq}, "
-                  f"max_length={max_length}, padded_batch={padded_batch_size} "
-                  f"(pad_ratio={padded_batch_size/len(batch_inds):.1f}x)",
-                  flush=True)
-            effective = max(int(p99 * 2), 4) if self.max_seq_len < 0 else self.max_seq_len
-            print(f"  [BUFFER] seq_len distribution: "
-                  f"p50={p50}, p90={p90}, p99={p99}, max={raw_max} "
-                  f"(n_raw_seq={len(raw_starts)}, max_seq_len={self.max_seq_len}"
-                  f"{f', effective={effective}' if self.max_seq_len < 0 else ''})",
-                  flush=True)
-            self._pad_logged = True
+
+        pad_ratio = padded_batch_size / len(batch_inds)
+        stats = self._pad_stats
+        stats["padded"] += padded_batch_size
+        stats["real"] += len(batch_inds)
+        stats["n_seq"] += n_seq
+        stats["calls"] += 1
+        stats["ratio_max"] = max(stats["ratio_max"], pad_ratio)
+
         # We retrieve the lstm hidden states that will allow
-        # to properly initialize the LSTM at the beginning of each sequence
+        # to properly initialize the LSTM at the beginning of each sequence.
+        # swap_and_flatten lays the buffer out env-major, so a flat index maps back to
+        # (step, env) and the original (n_steps, n_layers, n_envs, dim) arrays can be
+        # indexed directly instead of keeping a flattened copy of the whole rollout.
+        flat_idx = batch_inds[self.seq_start_indices]
+        step_idx = flat_idx % self.buffer_size
+        env_idx = flat_idx // self.buffer_size
         lstm_states_pi = (
-            # 1. (n_envs * n_steps, n_layers, dim) -> (batch_size, n_layers, dim)
-            # 2. (batch_size, n_layers, dim)  -> (n_seq, n_layers, dim)
-            # 3. (n_seq, n_layers, dim) -> (n_layers, n_seq, dim)
-            self._flat_hidden_states_pi[batch_inds][self.seq_start_indices].swapaxes(0, 1),
-            self._flat_cell_states_pi[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+            # (n_steps, n_envs, n_layers, dim) -> (n_seq, n_layers, dim) -> (n_layers, n_seq, dim)
+            self.hidden_states_pi.swapaxes(1, 2)[step_idx, env_idx].swapaxes(0, 1),
+            self.cell_states_pi.swapaxes(1, 2)[step_idx, env_idx].swapaxes(0, 1),
         )
         lstm_states_vf = (
-            # (n_envs * n_steps, n_layers, dim) -> (n_layers, n_seq, dim)
-            self._flat_hidden_states_vf[batch_inds][self.seq_start_indices].swapaxes(0, 1),
-            self._flat_cell_states_vf[batch_inds][self.seq_start_indices].swapaxes(0, 1),
+            self.hidden_states_vf.swapaxes(1, 2)[step_idx, env_idx].swapaxes(0, 1),
+            self.cell_states_vf.swapaxes(1, 2)[step_idx, env_idx].swapaxes(0, 1),
         )
         lstm_states_pi = (self.to_torch(lstm_states_pi[0]).contiguous(), self.to_torch(lstm_states_pi[1]).contiguous())
         lstm_states_vf = (self.to_torch(lstm_states_vf[0]).contiguous(), self.to_torch(lstm_states_vf[1]).contiguous())
@@ -412,10 +510,14 @@ class RecurrentMaskableDictRolloutBuffer(DictRolloutBuffer):
         gae_lambda: float = 1,
         gamma: float = 0.99,
         n_envs: int = 1,
+        max_seq_len: int = 0,
+        seq_len_fill_ratio: float = 0.15,
     ):
         self.action_masks = None
         self.hidden_state_shape = hidden_state_shape
         self.seq_start_indices, self.seq_end_indices = None, None
+        self.max_seq_len = max_seq_len
+        self.seq_len_fill_ratio = seq_len_fill_ratio
         super().__init__(buffer_size, observation_space, action_space, device, gae_lambda, gamma, n_envs=n_envs)
 
     def reset(self):
@@ -511,12 +613,14 @@ class RecurrentMaskableDictRolloutBuffer(DictRolloutBuffer):
         env: Optional[VecNormalize] = None,
     ) -> RecurrentMaskableDictRolloutBufferSamples:
         # Retrieve sequence starts and utility function
-        self.seq_start_indices, self.pad, self.pad_and_flatten = create_sequencers(
-            self.episode_starts[batch_inds], env_change[batch_inds], self.device
+        self.seq_start_indices, self.seq_end_indices, self.pad, self.pad_and_flatten = create_sequencers(
+            self.episode_starts[batch_inds], env_change[batch_inds], self.device,
+            max_seq_len=self.max_seq_len,
+            fill_ratio=self.seq_len_fill_ratio,
         )
 
         n_seq = len(self.seq_start_indices)
-        max_length = self.pad(self.actions[batch_inds]).shape[1]
+        max_length = int((self.seq_end_indices - self.seq_start_indices).max()) + 1
         padded_batch_size = n_seq * max_length
         # We retrieve the lstm hidden states that will allow
         # to properly initialize the LSTM at the beginning of each sequence
